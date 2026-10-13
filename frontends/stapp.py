@@ -158,6 +158,10 @@ def render_sidebar():
     llm_options = agent.list_llms()
     current_idx = agent.llm_no
     llm_labels = {idx: f"{idx}: {(name or '').strip()}" for idx, name, _ in llm_options}
+    # 外部(hub/手机)切了通道 -> widget state 必须跟随真值, 否则带 key 的 selectbox 会用旧值把切换静默回滚
+    if st.session_state.get('_llm_shadow') != current_idx:
+        st.session_state['_llm_shadow'] = current_idx
+        st.session_state['sidebar_llm_select'] = current_idx
     st.caption(f"LLM Core: {llm_labels.get(current_idx, str(current_idx))}")
     selected_idx = st.selectbox("LLM", [idx for idx, _, _ in llm_options], index=next((i for i, (idx, _, _) in enumerate(llm_options) if idx == current_idx), 0), format_func=llm_labels.get, label_visibility="collapsed", key="sidebar_llm_select")
     if selected_idx != current_idx:
