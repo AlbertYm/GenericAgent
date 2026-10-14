@@ -485,6 +485,8 @@ class GenericAgentHandler(BaseHandler):
             return self._retry_or_exit("[ERROR] Blank response, regenerate and tooluse")
         if '[!!! 流异常中断' in content[-100:] or '!!!Error:' in content[50:][-100:] or (content.endswith('</summary>') and len(content) < 100):
             return self._retry_or_exit("[ERROR] Incomplete response. Regenerate and tooluse.")
+        if content.rstrip().endswith('</｜DSML｜ calls>'):
+            return self._retry_or_exit("[ERROR] Tool call format invalid; no tool was called. Regenerate using proper tool calls.")
         if 'max_tokens !!!]' in content[-100:]:
             return self._retry_or_exit("[ERROR] max_tokens limit reached. Use multi small steps to do it.")
         
