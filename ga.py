@@ -580,7 +580,7 @@ class GenericAgentHandler(BaseHandler):
             next_prompt += f"\n\n[DANGER] Turn {turn}. Call update_working_checkpoint to save key context. Stop ineffective retries; if no progress, switch strategy: 1) Probe physical boundaries 2) **Re-read relevant SOPs**"
         elif turn % 31 == 0:
             next_prompt += f"\n\n[DANGER] Turn {turn}. Write checkpoints/key findings/tried approaches to a **file** for future reference (not only working_checkpoint!). Avoid losing critical info."
-        elif turn % 10 == 0: next_prompt += get_global_memory()
+        elif turn % 10 == 0: next_prompt += f'<global_memory>{get_global_memory()}</global_memory>'
 
         if _plan and turn >= 10 and turn % 5 == 0:
             next_prompt = f"[Plan Hint] 正在计划模式。必须 file_read({_plan}) 确认当前步骤，回复开头引用：📌 当前步骤：...\n\n" + next_prompt
