@@ -6,7 +6,7 @@ if sys.stderr is None: sys.stderr = open(os.devnull, "w")
 elif hasattr(sys.stderr, 'reconfigure'): sys.stderr.reconfigure(errors='replace')
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from llmcore import reload_mykeys, ToolClient, MixinSession, NativeToolClient, NativeClaudeSession, NativeOAISession, resolve_client
+from llmcore import mykeys_store, ToolClient, MixinSession, NativeToolClient, NativeClaudeSession, NativeOAISession, resolve_client
 from agent_loop import agent_runner_loop
 try:
     from plugins.hooks import discover_and_load; discover_and_load()
@@ -64,8 +64,8 @@ class GenericAgent:
         self.intervene = self.extrakeyinfo = None
 
     def load_llm_sessions(self):
-        mykeys, changed = reload_mykeys()
-        if not changed and hasattr(self, 'llmclients'): return
+        mykeys, updated_at = mykeys_store.snapshot()
+        if hasattr(self, 'llmclients') and getattr(self, '_mykeys_updated_at', None) == updated_at: return
         try: oldhistory, oldname = self.llmclient.backend.history, self.llmclient.backend.name
         except: oldhistory = oldname = None
         llm_sessions = []
@@ -73,7 +73,7 @@ class GenericAgent:
             if not any(x in k for x in ['api', 'config', 'cookie']): continue
             try:
                 if 'mixin' in k: llm_sessions += [{'mixin_cfg': cfg}]
-                elif c := resolve_client(k): llm_sessions += [c]
+                elif c := resolve_client(k, cfg): llm_sessions += [c]
             except: pass
         for i, s in enumerate(llm_sessions):
             if isinstance(s, dict) and 'mixin_cfg' in s:
@@ -83,11 +83,15 @@ class GenericAgent:
                     else: llm_sessions[i] = ToolClient(mixin)
                 except Exception as e: print(f'\n\n\n[ERROR] Failed to init MixinSession with cfg {s["mixin_cfg"]}: {e}!!!\n\n')
         self.llmclients = llm_sessions
-        if not self.llmclients: return
+        if not self.llmclients:
+            self.llmclient = None
+            self._mykeys_updated_at = updated_at
+            return
         names = [c.backend.name if not isinstance(c, dict) else f'BADMIXIN_{i}' for i, c in enumerate(self.llmclients)]
         if oldname in names: self.llm_no = names.index(oldname)
         self.llmclient = self.llmclients[self.llm_no%len(self.llmclients)]
         if oldhistory: self.llmclient.backend.history = oldhistory
+        self._mykeys_updated_at = updated_at
     
     def next_llm(self, n=-1):
         self.load_llm_sessions()
