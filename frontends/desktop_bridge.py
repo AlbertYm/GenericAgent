@@ -2938,18 +2938,6 @@ def create_app():
     if _e2e_control_token() is not None:
         app.router.add_post("/__e2e__/next-turn", e2e_next_turn_handler)
 
-    # Serve static frontend (desktop/static/)
-    static_dir = APP_DIR / "desktop" / "static"
-
-    async def index_handler(request):
-        return web.FileResponse(
-            static_dir / "index.html",
-            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
-        )
-
-    app.router.add_get("/", index_handler)
-    app.router.add_static("/", static_dir, show_index=False)
-
     async def on_startup(app):
         hub.loop = asyncio.get_running_loop()
         services.autostart_extras()
