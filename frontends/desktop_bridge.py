@@ -250,7 +250,11 @@ class Session:
     untitled: bool = True
     plan_scan_baseline: int = 0
     plan_path: str = ""
-    llm_history: Optional[List[dict]] = None
+    llm_history: Optional[List[dict]] = None  # memory only; reconstructed from MR/L4
+    first_message: str = ""
+    first_message_at: float = 0
+    log_refs: List[dict] = field(default_factory=list)
+    has_content: bool = False
     # 该会话绑定的模型下标(mykey.py 配置块顺序,== agent.llmclients 下标)。
     # None = 未绑定,发消息时回退到全局默认 ui.llmNo,保持旧会话平滑迁移。
     llm_no: Optional[int] = None
@@ -334,20 +338,16 @@ class AgentManager:
         return str(Path(self.ga_root) / "mykey.py")
 
     def _session_dict(self, s: "Session") -> dict:
-        llm_hist = None
-        if s.agent and hasattr(s.agent, 'llmclient'):
-            try: llm_hist = s.agent.llmclient.backend.history
-            except Exception: pass
-        if llm_hist is None:
-            llm_hist = s.llm_history
+        from desktop_history import metadata
         return {"id": s.id, "title": s.title, "cwd": s.cwd,
                 "created_at": s.created_at, "updated_at": s.updated_at,
-                "messages": s.messages, "msg_seq": s.msg_seq,
-                "pinned": s.pinned, "untitled": s.untitled,
+                "msg_seq": s.msg_seq, "pinned": s.pinned, "untitled": s.untitled,
                 "plan_scan_baseline": s.plan_scan_baseline,
-                "plan_path": s.plan_path or "",
-                "llm_no": s.llm_no,
-                "llm_history": llm_hist}
+                "plan_path": s.plan_path or "", "llm_no": s.llm_no,
+                **metadata({"first_message": s.first_message,
+                            "first_message_at": s.first_message_at,
+                            "log_refs": s.log_refs, "has_content": s.has_content,
+                            "messages": s.messages})}
 
     def _session_file(self, sid: str) -> Path:
         return self._sessions_dir / f"{sid}.json"
@@ -425,9 +425,6 @@ class AgentManager:
             self._sessions_dir.mkdir(parents=True, exist_ok=True)
             with self.lock:
                 data = self._session_dict(s)
-                data["messages"] = copy.deepcopy(data["messages"])
-                if data.get("llm_history"):
-                    data["llm_history"] = copy.deepcopy(data["llm_history"])
             tmp.write_text(json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
             os.replace(tmp, self._session_file(s.id))
         except Exception as e:
@@ -452,22 +449,23 @@ class AgentManager:
         for s in sessions:
             self._persist_session(s, strict=strict)
 
-    def _session_from_item(self, item: dict) -> "Session":
+    def _session_from_item(self, item: dict) -> Optional["Session"]:
+        from desktop_history import legacy_anchors, load
+        anchors = legacy_anchors(item)
         item = canonical_session_record(item, default_cwd=self.ga_root)
-        msgs = item["messages"]
-        return Session(id=item["id"], title=item["title"],
-                       cwd=item["cwd"],
-                       created_at=item["created_at"],
-                       updated_at=item["updated_at"],
-                       messages=msgs,
-                       msg_seq=item["msg_seq"],
-                       pinned=item["pinned"],
-                       untitled=item["untitled"],
-                       plan_scan_baseline=_load_plan_baseline(item, msgs),
+        restored = load(self.ga_root, item, anchors)
+        if restored is None:
+            return None
+        msgs, history, meta = restored
+        return Session(id=item["id"], title=item["title"], cwd=item["cwd"],
+                       created_at=item["created_at"], updated_at=item["updated_at"],
+                       messages=msgs, msg_seq=max(item["msg_seq"], len(msgs)),
+                       pinned=item["pinned"], untitled=item["untitled"],
+                       plan_scan_baseline=min(item["plan_scan_baseline"], len(msgs)),
                        plan_path=_sanitize_desktop_plan_path(item["id"], item["plan_path"]),
-                       status="idle", agent=None,
-                       llm_history=item["llm_history"],
-                       llm_no=item["llm_no"])
+                       status="idle", agent=None, llm_history=history, llm_no=item["llm_no"],
+                       first_message=meta["first_message"], first_message_at=meta["first_message_at"],
+                       log_refs=meta["log_refs"], has_content=meta["has_content"])
 
     def _load_sessions(self):
         # New format: one file per session under temp/desktop_sessions/.
@@ -479,7 +477,11 @@ class AgentManager:
                         if not _is_desktop_session_id(item.get("id")):
                             continue
                         sess = self._session_from_item(item)
+                        if sess is None:
+                            f.write_text(json.dumps(canonical_session_record(item), ensure_ascii=False), encoding="utf-8")
+                            continue
                         self.sessions[sess.id] = sess
+                        self._persist_session(sess)
                     except Exception as e:
                         bridge_print(f"[bridge] load session {f.name} failed: {e}")
         except Exception as e:
@@ -496,14 +498,15 @@ class AgentManager:
                         continue
                     try:
                         sess = self._session_from_item(item)
+                        if sess is None:
+                            continue
                         self.sessions[sess.id] = sess
                         self._persist_session(sess)
                     except Exception as e:
                         bridge_print(f"[bridge] migrate session failed: {e}")
                 # Retire the legacy file so we do not migrate again next launch.
                 with contextlib.suppress(Exception):
-                    self._sessions_file.rename(
-                        self._sessions_file.parent / (self._sessions_file.name + ".migrated"))
+                    self._sessions_file.unlink()
         except Exception as e:
             bridge_print(f"[bridge] migrate sessions failed: {e}")
 
@@ -557,6 +560,9 @@ class AgentManager:
                 try:
                     sess = self._session_from_item(item)
                 except ValueError:
+                    skipped += 1
+                    continue
+                if sess is None:
                     skipped += 1
                     continue
                 self.sessions[sid] = sess
@@ -752,6 +758,9 @@ class AgentManager:
             no = sess.llm_no if sess.llm_no is not None else _global_default_llm_no()
             if no is not None:
                 agent.next_llm(int(no))
+            if sess.llm_history:
+                from continue_cmd import _derive_hist_info, _load_history_into
+                _load_history_into(agent, copy.deepcopy(sess.llm_history), _derive_hist_info(sess.llm_history))
             agent.inc_out = True
             agent.verbose = True
             threading.Thread(target=agent.run, daemon=True, name=f"GA-{sess.id}").start()
@@ -924,6 +933,12 @@ class AgentManager:
         msg = {"id": sess.msg_seq, "role": role, "content": content, "ts": time.time()}
         msg.update(extra)
         sess.messages.append(msg)
+        if role == "user":
+            from desktop_history import preview
+            if not sess.first_message:
+                sess.first_message = preview(content)
+                sess.first_message_at = msg["ts"]
+            sess.has_content = True
         sess.updated_at = time.time()
         if role == "user" and content.strip() and sess.title == "New chat":
             sess.title = content.strip().replace("\n", " ")[:40]
@@ -1085,13 +1100,14 @@ class AgentManager:
                 return
             if sess.agent is None:
                 sess.agent = self.make_agent(sess)
-                if sess.llm_history:
-                    try:
-                        sess.agent.llmclient.backend.history = sess.llm_history
-                    except Exception:
-                        pass
             agent = sess.agent
+            from desktop_history import preview
+            log_path = getattr(agent, "log_path", None)
             with self.lock:
+                if log_path and not any(r["name"] == Path(log_path).name for r in sess.log_refs):
+                    sess.log_refs.append({"name": Path(log_path).name,
+                                          "started_at": time.time(), "first_message": preview(prompt)})
+                    self._persist_session(sess)
                 sess.running_llm_no = agent.llm_no
                 try:
                     running_backend = agent.llmclient.backend
@@ -1290,25 +1306,6 @@ class AgentManager:
         if no is not None and hasattr(agent, "next_llm"):
             with contextlib.suppress(Exception):
                 agent.next_llm(int(no))
-        if sess.llm_history:
-            try:
-                agent.llmclient.backend.history = sess.llm_history
-            except Exception as e:
-                bridge_print(f"[bridge] restore llm_history failed: {e}")
-        else:
-            history = []
-            for m in sess.messages:
-                role = m.get("role")
-                content = m.get("content", "")
-                if role == "user":
-                    history.append({"role": "user", "content": [{"type": "text", "text": content}]})
-                elif role == "assistant":
-                    history.append({"role": "assistant", "content": [{"type": "text", "text": content}]})
-            if history:
-                try:
-                    agent.llmclient.backend.history = history
-                except Exception as e:
-                    bridge_print(f"[bridge] inject history failed: {e}")
         with self.lock:
             sess.agent = agent
             sess.status = "idle"

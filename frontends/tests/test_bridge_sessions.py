@@ -147,7 +147,8 @@ class TestPersistSessionConcurrentMutation:
         f = manager._session_file(sess.id)
         data = json.loads(f.read_text(encoding="utf-8"))
         assert data["id"] == sess.id
-        assert isinstance(data["messages"], list)
+        assert "messages" not in data
+        assert data["storage_version"] == 2
 
     def test_concurrent_mutation_llm_history(self, manager: AgentManager):
         """Mutating llm_history from another thread during persist must not corrupt."""
@@ -176,7 +177,7 @@ class TestPersistSessionConcurrentMutation:
 
         f = manager._session_file(sess.id)
         data = json.loads(f.read_text(encoding="utf-8"))
-        assert isinstance(data["llm_history"], list)
+        assert "llm_history" not in data
 
 
 class TestTransactionalDataImport:
@@ -563,6 +564,12 @@ class TestSessionContinuityAfterRestart:
     def test_persist_and_reload_preserves_llm_no(self, manager: AgentManager):
         """Full cycle: persist session with llm_no, reload, verify llm_no survives."""
         sess = _make_session(sid="sess-roundtrip")
+        from test_desktop_history import seed_mr, record
+        seed_mr(Path(manager.ga_root), "model_responses_roundtrip.txt")
+        meta = record("model_responses_roundtrip.txt")
+        sess.log_refs = meta["log_refs"]
+        sess.first_message = meta["first_message"]
+        sess.first_message_at = meta["first_message_at"]
         sess.llm_no = 5
         sess.llm_history = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
         manager.sessions[sess.id] = sess
@@ -574,7 +581,8 @@ class TestSessionContinuityAfterRestart:
         reloaded = manager.sessions.get("sess-roundtrip")
         assert reloaded is not None
         assert reloaded.llm_no == 5
-        assert reloaded.llm_history == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        assert reloaded.llm_history[0]["content"][0]["text"] == "hello"
+        assert len(reloaded.llm_history) == 2
         assert reloaded.agent is None
 
 
@@ -1311,6 +1319,9 @@ class TestCanonicalSessionRestart:
                 "unknown": "ignored",
             },
         }
+        from test_desktop_history import seed_mr, record as log_record
+        seed_mr(Path(manager.ga_root), "model_responses_canonical.txt")
+        records["valid.json"].update(log_record("model_responses_canonical.txt"))
         for name, record in records.items():
             (manager._sessions_dir / name).write_text(json.dumps(record), encoding="utf-8")
 
