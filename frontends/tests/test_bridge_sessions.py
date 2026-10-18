@@ -1410,6 +1410,8 @@ def test_agent_constructor_owns_default_model(manager, monkeypatch, selected, ex
         def run(self):
             pass
 
+    from frontends import hub
+    monkeypatch.setattr(hub, "connect", lambda *a, **kw: None)
     monkeypatch.setattr(manager, "ensure_ga_import_path", lambda: Path(manager.ga_root))
     monkeypatch.setitem(sys.modules, "agentmain", _make_stub("agentmain", {"GenericAgent": FakeAgent}))
     monkeypatch.setattr(_mod, "_settings_doc", lambda: {"ui": {"llmNo": 4}})

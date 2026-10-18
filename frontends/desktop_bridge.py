@@ -764,10 +764,31 @@ class AgentManager:
             agent.inc_out = True
             agent.verbose = True
             threading.Thread(target=agent.run, daemon=True, name=f"GA-{sess.id}").start()
+            sess.agent = agent
+            from frontends import hub
+            hub.connect(agent, f"desktop-{sess.id}",
+                        put_task=lambda text: self._hub_command(sess, "put", text),
+                        abort=lambda: self._hub_command(sess, "abort"))
             return agent
         finally:
             with contextlib.suppress(Exception):
                 os.chdir(old_cwd)
+
+    def _hub_command(self, sess: Session, op: str, text=None):
+        """Use the same entrance as Desktop; Hub reads state/output directly from GA."""
+        try:
+            with self.mutation():
+                if self.sessions.get(sess.id) is not sess:
+                    return {"error": "session deleted", "code": "gone"}
+                if op == "put":
+                    if not isinstance(text, str) or not text.strip():
+                        return {"error": "text must be non-empty", "code": "badop"}
+                    if self._session_has_unfinished_work(sess):
+                        return {"error": "session is busy", "code": "busy"}
+                    return self.submit_prompt(sess.id, text)
+                return self.cancel(sess.id)
+        except MaintenanceConflict as exc:
+            return {"error": str(exc), "code": "busy"}
 
     @staticmethod
     def _base_display_name(var: str, cfg: Optional[dict]) -> str:
@@ -977,6 +998,9 @@ class AgentManager:
             if sess.agent and hasattr(sess.agent, "abort"):
                 with contextlib.suppress(Exception):
                     sess.agent.abort()
+            peer = getattr(sess.agent, "_hub", None)
+            if peer:
+                peer.close()
             if self._session_has_unfinished_work(sess):
                 self._retired_sessions[sid] = sess
             emit_session_state(sess, "closed")
