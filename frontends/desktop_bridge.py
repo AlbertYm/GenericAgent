@@ -256,7 +256,7 @@ class Session:
     log_refs: List[dict] = field(default_factory=list)
     has_content: bool = False
     # 该会话绑定的模型下标(mykey.py 配置块顺序,== agent.llmclients 下标)。
-    # None = 未绑定,发消息时回退到全局默认 ui.llmNo,保持旧会话平滑迁移。
+    # None = 未显式选择，保留 GenericAgent 构造时的模型。
     llm_no: Optional[int] = None
     # 当前正在执行的 turn 使用的模型。仅运行期存在，不写入 session JSON。
     running_llm_no: Optional[int] = None
@@ -755,9 +755,9 @@ class AgentManager:
             agentmain = importlib.import_module("agentmain")
             GA = getattr(agentmain, "GenericAgent")
             agent = GA()
-            no = sess.llm_no if sess.llm_no is not None else _global_default_llm_no()
-            if no is not None:
-                agent.next_llm(int(no))
+            if sess.llm_no is not None and sess.llm_no != agent.llm_no:
+                agent.next_llm(int(sess.llm_no))
+            sess.llm_no = agent.llm_no
             if sess.llm_history:
                 from continue_cmd import _derive_hist_info, _load_history_into
                 _load_history_into(agent, copy.deepcopy(sess.llm_history), _derive_hist_info(sess.llm_history))
@@ -810,20 +810,19 @@ class AgentManager:
             cfg = mk.get(k) if isinstance(mk.get(k), dict) else {}
             if "mixin" in k:
                 all_mixin_members.update(str(m) for m in (cfg.get("llm_nos") or []))
-        active = self.config.get("llmNo", 0)
         out = []
         for i, k in enumerate(keys):
             cfg = mk.get(k) if isinstance(mk.get(k), dict) else {}
             if "mixin" in k:
                 members = [str(m) for m in (cfg.get("llm_nos") or [])]
                 out.append({"id": i, "varName": k, "kind": "mixin", "name": str(cfg.get("name") or k),
-                            "members": members, "active": i == active})
+                            "members": members})
             else:
                 name = self._base_display_name(k, cfg)
                 out.append({"id": i, "varName": k, "kind": "native", "name": name,
                             "model": cfg.get("model", ""),
                             "group": "native" if "native" in k else "std",
-                            "inMixin": name in all_mixin_members, "active": i == active})
+                            "inMixin": name in all_mixin_members})
         return out
 
     def add_to_mixin(self, profile_id: int) -> dict:
@@ -947,7 +946,7 @@ class AgentManager:
 
     def create_session(self, cwd: Optional[str] = None) -> Session:
         sid = "sess-" + uuid.uuid4().hex[:12]
-        sess = Session(id=sid, cwd=str(cwd or self.ga_root), llm_no=_global_default_llm_no())
+        sess = Session(id=sid, cwd=str(cwd or self.ga_root))
         with self.mutation():
             self.sessions[sid] = sess
             self.active_session_id = sid
@@ -1301,11 +1300,6 @@ class AgentManager:
             if sess.agent is not None:
                 return {"ok": True, "sessionId": sid, "restored": False, "reason": "agent already alive"}
         agent = self.make_agent(sess)
-        # 恢复 agent 时按会话绑定 seed 模型(未绑定则全局默认),保持显示/使用一致。
-        no = sess.llm_no if sess.llm_no is not None else _global_default_llm_no()
-        if no is not None and hasattr(agent, "next_llm"):
-            with contextlib.suppress(Exception):
-                agent.next_llm(int(no))
         with self.lock:
             sess.agent = agent
             sess.status = "idle"
@@ -2047,7 +2041,7 @@ async def status_handler(request):
 
 
 _SETTINGS = Path.home() / ".ga_desktop_settings.json"
-_UI_KEYS = ("lang", "theme", "appearance", "plain", "llmNo", "fontSize")
+_UI_KEYS = ("lang", "theme", "appearance", "plain", "fontSize")
 
 
 def _settings_doc() -> dict:
@@ -2060,21 +2054,12 @@ def _update_settings_doc(mutate) -> dict:
 
 def _desktop_ui() -> dict:
     ui = _settings_doc().get("ui")
-    return dict(ui) if isinstance(ui, dict) else {}
+    return {k: ui[k] for k in _UI_KEYS if k in ui} if isinstance(ui, dict) else {}
 
 
 def _conductor_settings() -> dict:
     conductor = _settings_doc().get("conductor")
     return dict(conductor) if isinstance(conductor, dict) else {}
-
-
-def _global_default_llm_no() -> int:
-    """全局默认模型下标。会话未绑定(sess.llm_no is None)时回退到它。"""
-    no = _desktop_ui().get("llmNo")
-    try:
-        return int(no) if no is not None else 0
-    except (TypeError, ValueError):
-        return 0
 
 
 def _parse_model_no(value: Any) -> Optional[int]:
@@ -2090,27 +2075,18 @@ def _resolve_conductor_model_state(doc: dict, profile_count: int) -> dict:
     """Resolve persisted Conductor config without relying on modulo selection."""
     count = max(0, int(profile_count or 0))
     conductor = doc.get("conductor") if isinstance(doc, dict) else None
-    ui = doc.get("ui") if isinstance(doc, dict) else None
     raw_configured = conductor.get("llmNo") if isinstance(conductor, dict) else None
     configured = _parse_model_no(raw_configured)
-    ui_default = _parse_model_no(ui.get("llmNo")) if isinstance(ui, dict) else None
 
     if count <= 0:
         return {"configured": configured, "effective": None, "fallbackReason": "no_models"}
     if configured is not None and 0 <= configured < count:
         return {"configured": configured, "effective": configured, "fallbackReason": None}
-    if ui_default is not None and 0 <= ui_default < count:
-        reason = "invalid_configured" if raw_configured is not None else "ui_default"
-        return {"configured": configured, "effective": ui_default, "fallbackReason": reason}
     return {"configured": configured, "effective": 0, "fallbackReason": "first_available"}
 
 
 async def get_config_handler(request):
-    profiles = manager.list_model_profiles()
-    active = next((p["id"] for p in profiles if p.get("active")), manager.config.get("llmNo", 0))
     cfg = dict(manager.config)
-    if "llmNo" not in cfg:
-        cfg["llmNo"] = active
     cfg.update(_desktop_ui())
     cfg["conductor"] = _conductor_settings()
     return json_ok({"gaRoot": manager.ga_root, "mykeyPath": manager.mykey_path, "config": cfg})
@@ -2133,7 +2109,7 @@ async def save_config_handler(request):
                 except DesktopSettingsError as error:
                     bridge_print(f"[bridge] save ui prefs failed: {error}")
                     return json_ok({"ok": False, "error": str(error)}, status=500)
-            manager.config.update(cfg)
+            manager.config.update({k: v for k, v in cfg.items() if k != "llmNo"})
     return json_ok({"ok": True, "gaRoot": manager.ga_root, "mykeyPath": manager.mykey_path, "config": manager.config})
 
 
