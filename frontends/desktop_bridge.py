@@ -246,6 +246,7 @@ class Session:
     partial: Optional[dict] = None
     status: str = "idle"  # idle|running|error|cancelled
     agent: Any = None
+    pending_restore: bool = False  # Only records read back from storage await restoration.
     thread: Optional[threading.Thread] = None
     cancel_requested: bool = False
     active_turn_id: str = ""
@@ -463,7 +464,8 @@ class AgentManager:
                        plan_path=_sanitize_desktop_plan_path(item["id"], item["plan_path"]),
                        llm_no=item["llm_no"],
                        first_message=meta["first_message"], first_message_at=meta["first_message_at"],
-                       log_refs=meta["log_refs"], has_content=meta["has_content"])
+                       log_refs=meta["log_refs"], has_content=meta["has_content"],
+                       pending_restore=True)
 
     def _load_sessions(self):
         # New format: one file per session under temp/desktop_sessions/.
@@ -762,6 +764,7 @@ class AgentManager:
             agent.verbose = True
             threading.Thread(target=agent.run, daemon=True, name=f"GA-{sess.id}").start()
             sess.agent = agent
+            sess.pending_restore = False
             self._sync_display_cache(sess)
             from frontends import hub
             hub.connect(agent, f"desktop-{sess.id}",
@@ -965,7 +968,7 @@ class AgentManager:
             "title": sess.title,
             "cwd": sess.cwd,
             "status": sess.status,
-            "loaded": sess.agent is not None,
+            "loaded": not sess.pending_restore,
             "createdAt": sess.created_at,
             "updatedAt": sess.updated_at,
             "lastError": sess.last_error,
@@ -1054,7 +1057,10 @@ class AgentManager:
             if sess.status == "running":
                 raise web.HTTPConflict(text=json.dumps({"error": "session is already running"}, ensure_ascii=False), content_type="application/json")
             if sess.agent is None and _e2e_control_token() is None:
-                self.restore_context(sid)
+                if sess.pending_restore:
+                    self.restore_context(sid)
+                else:
+                    self.make_agent(sess)
             extra = {}
             if image_ids:
                 extra["image_ids"] = image_ids
@@ -1155,7 +1161,8 @@ class AgentManager:
                 emit_session_state(sess, "idle")
                 return
             if sess.agent is None:
-                self.restore_context(sess.id)
+                with self.mutation():
+                    self.make_agent(sess)
             agent = sess.agent
             from desktop_history import preview
             log_path = getattr(agent, "log_path", None)
@@ -1354,7 +1361,7 @@ class AgentManager:
             sess = self.sessions.get(sid)
             if not sess:
                 raise web.HTTPNotFound(text=json.dumps({"error": f"session not found: {sid}"}), content_type="application/json")
-            if sess.agent is not None:
+            if not sess.pending_restore:
                 return {"ok": True, "sessionId": sid, "restored": False, "loaded": True}
             try:
                 self.make_agent(sess)

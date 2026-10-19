@@ -198,3 +198,39 @@ def test_display_cache_is_rebuildable_and_follows_ga(manager):
     sess.agent.all_outputs.clear()
     manager._sync_display_cache(sess)
     assert sess.messages == []
+
+
+def test_new_session_is_not_pending_restore_until_bridge_reload(manager, monkeypatch):
+    sess = manager.create_session()
+    assert sess.agent is None
+    assert manager.snapshot(sess)['loaded'] is True
+    def unexpected(*args, **kwargs):
+        raise AssertionError('normal session must not enter history restoration')
+    monkeypatch.setattr(manager, 'make_agent', unexpected)
+    assert manager.restore_context(sess.id)['restored'] is False
+    manager.set_session_model(sess.id, 1)
+    assert manager.snapshot(sess)['loaded'] is True
+    assert 'pending_restore' not in manager._session_dict(sess)
+    manager.sessions.clear()
+    manager._load_sessions()
+    restored = manager.sessions[sess.id]
+    assert restored.agent is None
+    assert manager.snapshot(restored)['loaded'] is False
+
+
+def test_new_prompt_initializes_ga_without_restore_path(manager, monkeypatch):
+    monkeypatch.setattr(sys.modules['plan_state'], 'sync_plan_path_from_text', lambda *a: None, raising=False)
+    sess = manager.create_session()
+    monkeypatch.setattr(manager, 'ensure_ga_import_path', lambda: Path(manager.ga_root))
+    monkeypatch.setitem(sys.modules, 'agentmain', _make_stub('agentmain', {'GenericAgent': FakeAgent}))
+    monkeypatch.setattr(hub, 'connect', lambda *a, **kw: None)
+    def unexpected(*args, **kwargs):
+        raise AssertionError('new prompt must not enter history restoration')
+    monkeypatch.setattr(manager, 'restore_context', unexpected)
+    result = manager.submit_prompt(sess.id, 'hello')
+    assert result['accepted']
+    sess.thread.join(timeout=3)
+    assert not sess.thread.is_alive()
+    assert sess.agent is not None
+    assert manager.snapshot(sess)['loaded'] is True
+    assert sess.status == 'idle'
