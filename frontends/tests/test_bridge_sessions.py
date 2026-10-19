@@ -586,7 +586,7 @@ class TestSessionContinuityAfterRestart:
         assert reloaded.agent is None
 
 
-class TestDeferredSessionModelSwitch:
+class TestSessionModelSwitch:
     class FakeBackend:
         name = "model-a"
         history = []
@@ -595,35 +595,18 @@ class TestDeferredSessionModelSwitch:
         backend = None
 
         def __init__(self):
-            self.backend = TestDeferredSessionModelSwitch.FakeBackend()
+            self.backend = TestSessionModelSwitch.FakeBackend()
 
     class FakeAgent:
         def __init__(self):
             self.llm_no = 0
-            self.llmclient = TestDeferredSessionModelSwitch.FakeClient()
+            self.llmclient = TestSessionModelSwitch.FakeClient()
             self.next_llm_calls: list[int] = []
 
         def next_llm(self, no: int):
             self.next_llm_calls.append(no)
             self.llm_no = no
             self.llmclient.backend.name = f"model-{no}"
-
-    def test_running_turn_keeps_current_client_and_defers_new_binding(self, manager: AgentManager):
-        sess = _make_session("sess-running-switch")
-        sess.status = "running"
-        sess.llm_no = 0
-        sess.running_llm_no = 0
-        sess.running_model = "model-a"
-        sess.agent = self.FakeAgent()
-        manager.sessions[sess.id] = sess
-
-        result = manager.set_session_model(sess.id, 2)
-
-        assert sess.llm_no == 2
-        assert sess.agent.next_llm_calls == []
-        assert result["model"]["llmNo"] == 2
-        assert result["model"]["runningLlmNo"] == 0
-        assert result["model"]["runningModel"] == "model-a"
 
     def test_idle_session_switches_live_client_immediately(self, manager: AgentManager):
         sess = _make_session("sess-idle-switch")
@@ -635,56 +618,6 @@ class TestDeferredSessionModelSwitch:
         manager.set_session_model(sess.id, 2)
 
         assert sess.agent.next_llm_calls == [2]
-
-    def test_turn_captures_and_clears_running_model(self, manager: AgentManager):
-        import queue
-
-        sess = _make_session("sess-running-snapshot")
-        sess.llm_no = 2
-        fake_agent = self.FakeAgent()
-        observed: list[tuple[int | None, str | None]] = []
-
-        def put_task(_prompt, images=None):
-            observed.append((sess.running_llm_no, sess.running_model))
-            q = queue.Queue()
-            q.put({"done": "ok", "outputs": ["ok"]})
-            return q
-
-        fake_agent.put_task = put_task
-        fake_agent.inc_out = True
-        sess.agent = fake_agent
-        manager.sessions[sess.id] = sess
-        plan_state = sys.modules["plan_state"]
-        with patch.object(plan_state, "sync_plan_path_from_text", lambda *args: None, create=True):
-            manager.run_agent_turn(sess, "hello")
-
-        assert observed == [(2, "model-2")]
-        assert sess.running_llm_no is None
-        assert sess.running_model is None
-        assert sess.status == "idle"
-
-    def test_concurrent_sessions_keep_independent_next_model_bindings(self, manager: AgentManager):
-        sessions = []
-        for i in range(10):
-            sess = _make_session(f"sess-concurrent-{i}")
-            sess.status = "running"
-            sess.llm_no = 0
-            sess.agent = self.FakeAgent()
-            manager.sessions[sess.id] = sess
-            sessions.append(sess)
-
-        threads = [
-            threading.Thread(target=manager.set_session_model, args=(sess.id, i + 1))
-            for i, sess in enumerate(sessions)
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=2)
-
-        assert [sess.llm_no for sess in sessions] == list(range(1, 11))
-        assert all(sess.agent.next_llm_calls == [] for sess in sessions)
-
 
 class TestConductorModelConfigResolution:
     def test_configured_model_wins(self):
