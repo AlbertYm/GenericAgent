@@ -1507,12 +1507,9 @@ def discover_extra_services(ga_root: Path) -> List[dict]:
         out.append({
             "id": "reflect/scheduler.py",
             "cmd": [sys.executable, "agentmain.py", "--reflect", "reflect/scheduler.py"],
+            "shared": True, "singleton_port": 45762,
         })
-    # conductor 跟 scheduler 一样,bridge 启动时自动拉起。--no-browser 是关键:
-    # conductor.py 默认会用 webbrowser.open 在用户浏览器弹一个 8900 端口 UI,
-    # 桌面版自启时不需要这个独立 UI(用户从「指挥家」页直接访问)。
-    # The desktop conductor evolves with this bridge. Keep both package-owned and inject the
-    # external core through GA_ROOT instead of executing arbitrary UI glue from that checkout.
+    # Shared services may be launched, but never owned by the desktop.
     conductor = APP_DIR / "conductor.py"
     if conductor.is_file():
         conductor_port = _configured_conductor_port()
@@ -1525,7 +1522,7 @@ def discover_extra_services(ga_root: Path) -> List[dict]:
                 "--port",
                 str(conductor_port),
             ],
-            "port": conductor_port,
+            "port": conductor_port, "shared": True,
         })
     return out
 
@@ -1538,6 +1535,23 @@ def _port_alive(port: Optional[int]) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.3)
         return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _shared_service_alive(svc: dict) -> bool:
+    port = svc.get("singleton_port")
+    if not port:
+        return _port_alive(svc.get("port"))
+    # Scheduler's lock socket never accepts: probing with connect fills its backlog.
+    import errno
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE or getattr(exc, "winerror", None) == 10048:
+                return True
+            raise
+    return False
 
 
 def _mem_mb(pid: Optional[int]) -> Optional[int]:
@@ -1655,6 +1669,18 @@ class ServiceManager:
 
     def _state(self, sid: str, *, err: str = "") -> dict:
         proc = self.procs.get(sid)
+        svc = self._catalog.get(sid, {})
+        if svc.get("shared"):
+            running = _shared_service_alive(svc)
+            failed = proc is not None and proc.poll() is not None and not running
+            error = "" if running else err or (f"exit code {proc.returncode}" if failed else "")
+            return {
+                "id": sid, "status": "running" if running else "error" if error else "offline",
+                "running": running, "owned": False, "external": running,
+                "portConflict": False, "port": svc.get("port") or svc.get("singleton_port"),
+                "pid": None, "lastError": error, "errorKey": "",
+                "lastWarning": "", "warningKey": "",
+            }
         owned = proc is not None and proc.poll() is None
         running = owned
         status = "running" if owned else "offline"
@@ -1741,7 +1767,8 @@ class ServiceManager:
         item["name"] = sid
         item["memMb"] = _mem_mb(item.get("pid"))
         item["cpuPct"] = _cpu_pct(item.get("pid"))
-        item["managed"] = True
+        item["managed"] = not self._catalog[sid].get("shared", False)
+        item["canStart"] = True
         return item
 
     def list_panel_state(self) -> List[dict]:
@@ -1776,6 +1803,8 @@ class ServiceManager:
             svc = self._catalog.get(sid)
             if not svc:
                 raise KeyError(sid)
+            if svc.get("shared"):
+                return self._ensure_shared(sid, svc)
             proc = self.procs.get(sid)
             if proc is not None and proc.poll() is None:
                 return {"ok": True, "service": self._managed_state(sid)}
@@ -1817,6 +1846,31 @@ class ServiceManager:
                 return {"ok": False, "error": item["lastError"] or "start_failed", "service": item}
             return {"ok": True, "service": item}
 
+    def _ensure_shared(self, sid: str, svc: dict) -> dict:
+        if not _shared_service_alive(svc):
+            proc = self.procs.get(sid)
+            if proc is None or proc.poll() is not None:
+                kw = dict(cwd=str(self.ga_root), stdin=subprocess.DEVNULL,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          env={**os.environ, "GA_ROOT": str(self.ga_root)})
+                if sys.platform == "win32":
+                    kw["creationflags"] = (subprocess.DETACHED_PROCESS |
+                                           subprocess.CREATE_NEW_PROCESS_GROUP)
+                else:
+                    kw["start_new_session"] = True
+                proc = subprocess.Popen(svc["cmd"], **kw)
+                self.procs[sid] = proc  # Observe this launch only; never terminate it.
+            deadline = time.monotonic() + 10
+            while not _shared_service_alive(svc) and time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    break
+                time.sleep(.1)
+        item = self._managed_state(sid)
+        if not item["running"] and not item["lastError"]:
+            item = self._managed_state(sid, err="service not ready")
+        self._emit({"type": "service.changed", "service": item})
+        return {"ok": item["running"], "error": item["lastError"], "service": item}
+
     def autostart_extras(self) -> None:
         """Auto-start non-IM services on bridge boot. Currently:
           - reflect/scheduler.py (drives L4 archive cron every 12h).
@@ -1831,6 +1885,8 @@ class ServiceManager:
 
     def stop_all_extras(self) -> None:
         for sid in sorted(set(self._catalog) - set(self._im_catalog)):
+            if self._catalog[sid].get("shared"):
+                continue
             with contextlib.suppress(Exception):
                 self.stop_service(sid)
 
@@ -1850,11 +1906,9 @@ class ServiceManager:
         return bool(buf) and any("Exception in thread conductor-agent" in ln for ln in buf)
 
     def restart_broken_extras(self) -> None:
-        """mykey 被整体重写(导入密钥/编辑渠道配置)后,只重启「已经坏掉」的
-        conductor/scheduler。健康运行中的进程不动——它们会在下个任务靠自身 mtime
-        热重载新 key,强行重启反而会打断正在跑的任务。"""
+        """Retry failed owned extras after configuration changes; never restart shared services."""
         for sid in sorted(set(self._catalog) - set(self._im_catalog)):
-            if not self._extra_is_broken(sid):
+            if self._catalog[sid].get("shared") or not self._extra_is_broken(sid):
                 continue
             with contextlib.suppress(Exception):
                 self.stop_service(sid)
@@ -1869,6 +1923,8 @@ class ServiceManager:
         with self.lock:
             if sid not in self._catalog:
                 raise KeyError(sid)
+            if self._catalog[sid].get("shared"):
+                return {"ok": False, "error": "not_owned", "service": self._managed_state(sid)}
             self._stopping.add(sid)
             proc = self.procs.get(sid)
             stop_error = ""

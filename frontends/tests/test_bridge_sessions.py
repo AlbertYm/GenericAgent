@@ -43,6 +43,7 @@ _plan_state_stub = _make_stub("plan_state", {
     "is_session_scoped_plan_path": lambda p, sid: True,
     "is_plan_preset_prompt": lambda prompt: False,
     "PLAN_PRESETS": {},
+    "desktop_plan_payload_from_session": lambda *args: None,
 })
 
 for _name in ("agentmain", "llmcore", "agent_loop", "plugins", "reflect",
@@ -1179,3 +1180,67 @@ def test_legacy_ui_model_is_neither_read_nor_written(manager, monkeypatch, tmp_p
     assert response.status == 200
     assert "llmNo" not in manager.config
     assert json.loads(settings.read_text(encoding="utf-8"))["ui"]["llmNo"] == 4
+
+
+class TestSharedServices:
+    @pytest.mark.parametrize('sid', ['frontends/conductor.py', 'reflect/scheduler.py'])
+    def test_online_service_is_reused_even_after_duplicate_exit(self, manager, tmp_path, monkeypatch, sid):
+        from types import SimpleNamespace
+        sm = TestManagedServiceOwnership.service_manager(tmp_path)
+        sm._catalog = {sid: {'id': sid, 'shared': True, 'port': 8900, 'cmd': ['unused']}}
+        sm.procs[sid] = SimpleNamespace(poll=lambda: 1, returncode=1)
+        monkeypatch.setattr(_mod, 'manager', manager)
+        monkeypatch.setattr(_mod, '_shared_service_alive', lambda svc: True)
+        def unexpected(*args, **kwargs):
+            raise AssertionError('must not spawn, stop, or restart a shared service')
+        monkeypatch.setattr(_mod.subprocess, 'Popen', unexpected)
+        state = sm.start_service(sid)['service']
+        assert state['running'] and state['status'] == 'running'
+        assert not state['owned'] and not state['managed'] and not state['portConflict']
+        assert not state['lastError'] and state['canStart']
+        assert sm.stop_service(sid)['error'] == 'not_owned'
+        assert sm.running_managed_ids() == []
+        monkeypatch.setattr(sm, 'stop_service', unexpected)
+        monkeypatch.setattr(sm, 'start_service', unexpected)
+        sm.stop_all_extras()
+        sm.restart_broken_extras()
+
+    def test_spawned_service_is_detached_and_never_owned(self, manager, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        sm = TestManagedServiceOwnership.service_manager(tmp_path)
+        sid = 'frontends/conductor.py'
+        sm._catalog[sid]['shared'] = True
+        calls = []
+        def spawn(cmd, **kw):
+            calls.append(kw)
+            return SimpleNamespace(poll=lambda: None)
+        monkeypatch.setattr(_mod, 'manager', manager)
+        monkeypatch.setattr(_mod, '_shared_service_alive', lambda svc: bool(calls))
+        monkeypatch.setattr(_mod.subprocess, 'Popen', spawn)
+        assert sm.start_service(sid)['ok']
+        assert sm.start_service(sid)['ok']
+        assert len(calls) == 1
+        kw = calls[0]
+        assert kw['stdout'] == _mod.subprocess.DEVNULL
+        assert kw['stdin'] == _mod.subprocess.DEVNULL
+        assert kw['env']['GA_ROOT'] == str(tmp_path)
+        if sys.platform == 'win32':
+            assert kw['creationflags'] & _mod.subprocess.DETACHED_PROCESS
+        else:
+            assert kw['start_new_session']
+        assert sm.stop_service(sid)['error'] == 'not_owned'
+        sm.stop_all_extras()
+        assert not sm.running_managed_ids()
+
+    def test_singleton_probe_does_not_fill_accept_backlog(self):
+        import socket
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            listener.listen(1)
+            port = listener.getsockname()[1]
+            for _ in range(20):
+                assert _mod._shared_service_alive({'singleton_port': port})
+            listener.settimeout(.05)
+            with pytest.raises(socket.timeout):
+                listener.accept()
+        assert not _mod._shared_service_alive({'singleton_port': port})
