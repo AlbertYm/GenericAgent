@@ -239,6 +239,10 @@ class Session:
     updated_at: float = field(default_factory=time.time)
     messages: List[dict] = field(default_factory=list)
     msg_seq: int = 0
+    output_cache_source: Any = None
+    output_cache_count: int = 0
+    output_cache_tail: int = 0
+    output_cache_signature: Any = None
     partial: Optional[dict] = None
     status: str = "idle"  # idle|running|error|cancelled
     agent: Any = None
@@ -250,7 +254,6 @@ class Session:
     untitled: bool = True
     plan_scan_baseline: int = 0
     plan_path: str = ""
-    llm_history: Optional[List[dict]] = None  # memory only; reconstructed from MR/L4
     first_message: str = ""
     first_message_at: float = 0
     log_refs: List[dict] = field(default_factory=list)
@@ -450,20 +453,15 @@ class AgentManager:
             self._persist_session(s, strict=strict)
 
     def _session_from_item(self, item: dict) -> Optional["Session"]:
-        from desktop_history import legacy_anchors, load
-        anchors = legacy_anchors(item)
+        from desktop_history import metadata
+        meta = metadata(item)
         item = canonical_session_record(item, default_cwd=self.ga_root)
-        restored = load(self.ga_root, item, anchors)
-        if restored is None:
-            return None
-        msgs, history, meta = restored
         return Session(id=item["id"], title=item["title"], cwd=item["cwd"],
                        created_at=item["created_at"], updated_at=item["updated_at"],
-                       messages=msgs, msg_seq=max(item["msg_seq"], len(msgs)),
                        pinned=item["pinned"], untitled=item["untitled"],
-                       plan_scan_baseline=min(item["plan_scan_baseline"], len(msgs)),
+                       plan_scan_baseline=item["plan_scan_baseline"],
                        plan_path=_sanitize_desktop_plan_path(item["id"], item["plan_path"]),
-                       status="idle", agent=None, llm_history=history, llm_no=item["llm_no"],
+                       llm_no=item["llm_no"],
                        first_message=meta["first_message"], first_message_at=meta["first_message_at"],
                        log_refs=meta["log_refs"], has_content=meta["has_content"])
 
@@ -510,8 +508,6 @@ class AgentManager:
         except Exception as e:
             bridge_print(f"[bridge] migrate sessions failed: {e}")
 
-        if self.sessions:
-            self.active_session_id = max(self.sessions.values(), key=lambda s: s.updated_at).id
 
     def import_sessions(self, source_dir: str) -> dict:
         """把 source 的桌面会话合并进当前列表(按 id 去重)。
@@ -758,13 +754,15 @@ class AgentManager:
             if sess.llm_no is not None and sess.llm_no != agent.llm_no:
                 agent.next_llm(int(sess.llm_no))
             sess.llm_no = agent.llm_no
-            if sess.llm_history:
-                from continue_cmd import _derive_hist_info, _load_history_into
-                _load_history_into(agent, copy.deepcopy(sess.llm_history), _derive_hist_info(sess.llm_history))
+            if sess.has_content:
+                from desktop_history import restore_agent
+                meta = restore_agent(agent, self.ga_root, self._session_dict(sess))
+                sess.log_refs = meta["log_refs"]
             agent.inc_out = True
             agent.verbose = True
             threading.Thread(target=agent.run, daemon=True, name=f"GA-{sess.id}").start()
             sess.agent = agent
+            self._sync_display_cache(sess)
             from frontends import hub
             hub.connect(agent, f"desktop-{sess.id}",
                         put_task=lambda text: self._hub_command(sess, "put", text),
@@ -928,13 +926,46 @@ class AgentManager:
             return {"current": None, "isMixin": False, "llmNo": sess.llm_no,
                     "runningLlmNo": sess.running_llm_no, "runningModel": sess.running_model}
 
+    def _sync_display_cache(self, sess: Session):
+        """Disposable projection. Completed prefixes are reused; GA owns all text."""
+        agent = sess.agent
+        if agent is None or sess.status == "running" or getattr(agent, "is_running", False):
+            return  # stream queue supplies the temporary in-progress overlay
+        tasks = getattr(agent, "all_outputs", None)
+        if tasks is None:
+            return
+        signature = (len(tasks), str(tasks[-1].get("input", "")),
+                     tuple(tasks[-1].get("outputs") or [])) if tasks else (0,)
+        reset = sess.output_cache_source is not tasks or len(tasks) < sess.output_cache_count
+        if not reset and signature == sess.output_cache_signature and (sess.messages or not tasks):
+            return
+        from desktop_history import display_messages
+        start = 0 if reset or not sess.messages else max(0, sess.output_cache_count - 1)
+        offset = 0 if start == 0 else sess.output_cache_tail
+        projected = display_messages(tasks[start:])
+        for i, message in enumerate(projected, offset):
+            # Retain display-only metadata (attachments/timestamps), never cached text.
+            old = sess.messages[i] if i < len(sess.messages) else {}
+            projected[i - offset] = {**old, **message, "id": i + 1,
+                                     "ts": message.get("ts") or old.get("ts")}
+        sess.messages[offset:] = projected
+        sess.msg_seq = len(sess.messages)
+        sess.output_cache_source = tasks
+        sess.output_cache_count = len(tasks)
+        last_size = len(display_messages(tasks[-1:])) if tasks else 0
+        sess.output_cache_tail = len(sess.messages) - last_size
+        sess.output_cache_signature = signature
+
     def snapshot(self, sess: Session, include_messages: bool = True) -> dict:
+        if include_messages:
+            self._sync_display_cache(sess)
         out = {
             "sessionId": sess.id,
             "id": sess.id,
             "title": sess.title,
             "cwd": sess.cwd,
             "status": sess.status,
+            "loaded": sess.agent is not None,
             "createdAt": sess.created_at,
             "updatedAt": sess.updated_at,
             "lastError": sess.last_error,
@@ -1022,6 +1053,8 @@ class AgentManager:
                 raise web.HTTPNotFound(text=json.dumps({"error": f"session not found: {sid}"}, ensure_ascii=False), content_type="application/json")
             if sess.status == "running":
                 raise web.HTTPConflict(text=json.dumps({"error": "session is already running"}, ensure_ascii=False), content_type="application/json")
+            if sess.agent is None and _e2e_control_token() is None:
+                self.restore_context(sid)
             extra = {}
             if image_ids:
                 extra["image_ids"] = image_ids
@@ -1122,7 +1155,7 @@ class AgentManager:
                 emit_session_state(sess, "idle")
                 return
             if sess.agent is None:
-                sess.agent = self.make_agent(sess)
+                self.restore_context(sess.id)
             agent = sess.agent
             from desktop_history import preview
             log_path = getattr(agent, "log_path", None)
@@ -1238,8 +1271,6 @@ class AgentManager:
                 if turn_started:
                     msg_extra["executionMs"] = round((time.time() - turn_started) * 1000)
                 self.add_message(sess, "assistant", full, **msg_extra)
-                try: sess.llm_history = json.loads(json.dumps(agent.llmclient.backend.history, ensure_ascii=False, default=str))
-                except Exception: pass
                 sess.running_llm_no = None
                 sess.running_model = None
                 sess.status = "idle"
@@ -1267,6 +1298,7 @@ class AgentManager:
             sess = self.sessions.get(sid)
             if not sess:
                 raise web.HTTPNotFound(text=json.dumps({"error": f"session not found: {sid}"}, ensure_ascii=False), content_type="application/json")
+            self._sync_display_cache(sess)
             msgs = [m for m in sess.messages if int(m.get("id", 0)) > after]
             if limit > 0:
                 msgs = msgs[-limit:]
@@ -1317,17 +1349,27 @@ class AgentManager:
         return {"ok": True, "sessionId": sid}
 
     def restore_context(self, sid: str) -> dict:
-        with self.lock:
+        # Serialize publication with mutations: concurrent clicks cannot create duplicate GAs.
+        with self.mutation():
             sess = self.sessions.get(sid)
             if not sess:
-                raise web.HTTPNotFound(text=json.dumps({"error": f"session not found: {sid}"}, ensure_ascii=False), content_type="application/json")
+                raise web.HTTPNotFound(text=json.dumps({"error": f"session not found: {sid}"}), content_type="application/json")
             if sess.agent is not None:
-                return {"ok": True, "sessionId": sid, "restored": False, "reason": "agent already alive"}
-        agent = self.make_agent(sess)
-        with self.lock:
-            sess.agent = agent
+                return {"ok": True, "sessionId": sid, "restored": False, "loaded": True}
+            try:
+                self.make_agent(sess)
+            except FileNotFoundError:
+                # No source remains: omit the record, without deleting its metadata file.
+                self.sessions.pop(sid, None)
+                raise web.HTTPNotFound(text=json.dumps({"error": "history source no longer exists"}), content_type="application/json")
+            except Exception as exc:
+                sess.last_error = str(exc)
+                raise web.HTTPInternalServerError(text=json.dumps({"error": str(exc)}), content_type="application/json")
             sess.status = "idle"
-        return {"ok": True, "sessionId": sid, "restored": True, "messageCount": len(sess.llm_history or sess.messages)}
+            sess.last_error = ""
+            self._persist_session(sess)
+            return {"ok": True, "sessionId": sid, "restored": True, "loaded": True,
+                    "messageCount": len(sess.messages)}
 
     def set_session_model(self, sid: str, llm_no: int) -> dict:
         """Bind a model to a session.
@@ -2268,8 +2310,7 @@ async def cancel_handler(request):
 
 async def restore_handler(request):
     sid = request.match_info["sid"]
-    with manager.mutation():
-        return json_ok(manager.restore_context(sid))
+    return json_ok(await asyncio.to_thread(manager.restore_context, sid))
 
 
 async def session_model_handler(request):

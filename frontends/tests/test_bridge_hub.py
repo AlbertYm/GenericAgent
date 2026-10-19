@@ -128,3 +128,73 @@ def test_closed_hub_never_connects(monkeypatch):
     client = hub.HubClient("closed")
     client.close()
     asyncio.run(client._loop())
+
+
+def test_lazy_restore_populates_ga_once(manager, monkeypatch):
+    from test_desktop_history import seed_mr, record
+    import desktop_history
+    seed_mr(Path(manager.ga_root), 'model_responses_lazy.txt')
+    meta = record('model_responses_lazy.txt')
+    meta.update(id='sess-lazy', title='lazy', cwd=manager.ga_root, llm_no=1)
+    sess = manager._session_from_item(meta)
+    manager.sessions[sess.id] = sess
+    assert sess.agent is None and sess.messages == []
+    assert not hasattr(sess, 'llm_history')
+    assert manager.snapshot(sess)['loaded'] is False
+    connections = []
+    monkeypatch.setattr(hub, 'connect', lambda agent, *args, **kw: connections.append(agent))
+    monkeypatch.setattr(manager, 'ensure_ga_import_path', lambda: Path(manager.ga_root))
+    monkeypatch.setitem(sys.modules, 'agentmain', _make_stub('agentmain', {'GenericAgent': FakeAgent}))
+    assert manager.restore_context(sess.id)['restored']
+    agent = sess.agent
+    assert agent.llm_no == 1
+    assert agent.llmclient.backend.history
+    assert agent.history
+    assert agent.all_outputs[0]['input'] == 'hello'
+    assert 'world' in ''.join(agent.all_outputs[0]['outputs'])
+    assert sess.messages == desktop_history.display_messages(agent.all_outputs)
+    assert connections == [agent]
+    assert not manager.restore_context(sess.id)['restored']
+    assert connections == [agent] and sess.agent is agent
+    assert manager.snapshot(sess)['loaded'] is True
+
+
+def test_missing_history_never_connects(manager, monkeypatch):
+    from test_desktop_history import record
+    meta = record('model_responses_missing.txt')
+    meta.update(id='sess-missing', title='missing', cwd=manager.ga_root)
+    sess = manager._session_from_item(meta)
+    manager.sessions[sess.id] = sess
+    monkeypatch.setattr(manager, 'ensure_ga_import_path', lambda: Path(manager.ga_root))
+    monkeypatch.setitem(sys.modules, 'agentmain', _make_stub('agentmain', {'GenericAgent': FakeAgent}))
+    connections = []
+    monkeypatch.setattr(hub, 'connect', lambda *a, **kw: connections.append(a))
+    import pytest
+    with pytest.raises(_mod.web.HTTPNotFound):
+        manager.restore_context(sess.id)
+    assert sess.agent is None and not connections
+    assert sess.id not in manager.sessions
+
+
+def test_display_cache_is_rebuildable_and_follows_ga(manager):
+    sess = manager.create_session()
+    sess.agent = FakeAgent()
+    sess.agent.all_outputs = [{'input': 'one', 'outputs': ['answer1']}]
+    manager._sync_display_cache(sess)
+    prefix = sess.messages[0]
+    assert [m['content'] for m in sess.messages] == ['one', 'answer1']
+    sess.messages[0]['ts'] = 12345
+    sess.agent.all_outputs.append({'input': 'two', 'outputs': ['answer2']})
+    manager._sync_display_cache(sess)
+    assert [m['content'] for m in sess.messages] == ['one', 'answer1', 'two', 'answer2']
+    assert sess.messages[0]['ts'] == 12345
+    sess.agent.all_outputs.append({'input': 'three', 'outputs': ['answer3']})
+    prefix = sess.messages[0]
+    manager._sync_display_cache(sess)
+    assert sess.messages[0] is prefix
+    sess.messages.clear()
+    manager._sync_display_cache(sess)
+    assert len(sess.messages) == 6
+    sess.agent.all_outputs.clear()
+    manager._sync_display_cache(sess)
+    assert sess.messages == []
