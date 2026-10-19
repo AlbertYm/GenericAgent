@@ -769,7 +769,8 @@ class AgentManager:
             from frontends import hub
             hub.connect(agent, f"desktop-{sess.id}",
                         put_task=lambda text: self._hub_command(sess, "put", text),
-                        abort=lambda: self._hub_command(sess, "abort"))
+                        abort=lambda: self._hub_command(sess, "abort"),
+                        llm=lambda no=None: self._hub_command(sess, "llm", no))
             return agent
         finally:
             with contextlib.suppress(Exception):
@@ -787,6 +788,16 @@ class AgentManager:
                     if self._session_has_unfinished_work(sess):
                         return {"error": "session is busy", "code": "busy"}
                     return self.submit_prompt(sess.id, text)
+                if op == "llm":
+                    agent = sess.agent
+                    if text is None:
+                        return {"cur": agent.llm_no, "items": [n for _, n, _ in agent.list_llms()]}
+                    if self._session_has_unfinished_work(sess):
+                        return {"error": "session is busy", "code": "busy"}
+                    if type(text) is not int or not 0 <= text < len(agent.list_llms()):
+                        return {"error": f"no llm #{text}", "code": "badop"}
+                    self.set_session_model(sess.id, text)
+                    return {"ok": 1, "cur": agent.llm_no}
                 return self.cancel(sess.id)
         except MaintenanceConflict as exc:
             return {"error": str(exc), "code": "busy"}
@@ -1395,6 +1406,7 @@ class AgentManager:
                     sess.llm_no = sess.agent.llm_no
             sess.updated_at = time.time()
             self._persist_session(sess)
+        emit_session_state(sess, "model")
         return {"ok": True, "sessionId": sid, "llmNo": sess.llm_no, "model": self._live_model(sess)}
 
 

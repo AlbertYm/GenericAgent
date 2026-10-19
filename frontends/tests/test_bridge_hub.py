@@ -49,6 +49,9 @@ def test_desktop_hub_roundtrip(manager, monkeypatch):
     monkeypatch.setitem(sys.modules, "agentmain", _make_stub("agentmain", {"GenericAgent": FakeAgent}))
     monkeypatch.setattr(sys.modules["plan_state"], "sync_plan_path_from_text", lambda *a: None, raising=False)
 
+    events = []
+    monkeypatch.setattr(_mod.hub, "emit", events.append)
+
     async def exercise():
         arrivals = asyncio.Queue()
         peers = []
@@ -89,11 +92,26 @@ def test_desktop_hub_roundtrip(manager, monkeypatch):
                 assert not sessions[1].messages
                 assert (await rpc(peers[0], "get"))["tasks"][0]["input"] == "hello"
                 assert (await rpc(peers[0], "seg", i=0, j=0))["content"] == "answer:hello"
+                assert (await rpc(peers[0], "llm"))["items"] == ["zero", "one"]
+                before = len(events)
                 assert (await rpc(peers[0], "llm", no=1))["cur"] == 1
+                assert len(events) == before + 1
+                assert events[-1]["type"] == "session-state"
+                assert events[-1]["sessionId"] == sessions[0].id
+                assert events[-1]["status"] == "idle"
+                assert events[-1]["state"] == "model"
+                assert sessions[0].llm_no == 1
+                saved = json.loads((manager._sessions_dir / f"{sessions[0].id}.json").read_text())
+                assert saved["llm_no"] == 1
+                for invalid in (-1, 2, "1", True):
+                    assert (await rpc(peers[0], "llm", no=invalid))["code"] == "badop"
+                assert len(events) == before + 1
                 assert manager._live_model(sessions[0])["llmNo"] == 1
                 assert sessions[1].agent.llm_no == 0
                 assert (await rpc(peers[0], "put_task", text="hold"))["accepted"]
                 await wait_for(lambda: sessions[0].agent.is_running)
+                assert (await rpc(peers[0], "llm", no=0))["code"] == "busy"
+                assert sessions[0].agent.llm_no == 1
                 assert (await rpc(peers[0], "put_task", text="extra"))["code"] == "busy"
                 assert (await rpc(peers[0], "inject", kind="intervene", text="steer"))["ok"]
                 assert sessions[0].agent.intervene == "steer"
