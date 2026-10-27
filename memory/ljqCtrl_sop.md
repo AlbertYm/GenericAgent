@@ -33,7 +33,7 @@ ljqCtrl.Click(ox + (bbox[0]+bbox[2])//2, oy + (bbox[1]+bbox[3])//2)
 ```
 禁止全屏ImageGrab（必须针对窗口），所有逻辑坐标都要转物理。
 
-**macOS (`macljqCtrl`)**：`GrabScreen(bbox)` 区域截图后，图内点转屏幕物理坐标用 `CropToScreen(bbox, px, py)`，别手搓 `screencapture -R`（它吃逻辑点，会点歪）。
+**macOS (`macljqCtrl`)**：窗口/区域截图使用进程内 `CGWindowListCreateImage`，无需临时文件。实测 Python 已获录屏授权时，`screencapture` 子进程仍可能失败，原生调用可用。授权对象可用 `NSBundle.mainBundle().bundlePath()` 定位。`GrabScreen(bbox)` 图内点用 `CropToScreen(bbox, px, py)` 转屏幕物理坐标；保留主屏 dpi_scale 约定，混合DPI多屏未验收。
 
 ## 4. 避坑指南
 - **⚠️ 一律使用物理坐标**：传给 ljqCtrl.Click/SetCursorPos 的坐标必须是物理坐标（=截图像素坐标）。禁止传入逻辑坐标。
