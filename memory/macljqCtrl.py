@@ -157,10 +157,10 @@ _MODS = {
 
 def _key_tap(keycode, flags=0):
     down = Quartz.CGEventCreateKeyboardEvent(None, keycode, True)
-    if flags: Quartz.CGEventSetFlags(down, flags)
+    Quartz.CGEventSetFlags(down, flags)
     _post(down)
     up = Quartz.CGEventCreateKeyboardEvent(None, keycode, False)
-    if flags: Quartz.CGEventSetFlags(up, flags)
+    Quartz.CGEventSetFlags(up, flags)
     _post(up)
 
 def Press(cmd, staytime=0):
