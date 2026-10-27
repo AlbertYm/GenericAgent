@@ -40,7 +40,8 @@ ljqCtrl.Click(ox + (bbox[0]+bbox[2])//2, oy + (bbox[1]+bbox[3])//2)
 - **物理验证**：模拟操作前必须确保窗口已通过 `activate()` 置于前台。
 - **坐标对齐**: 物理坐标 = 截图坐标；ljqCtrl 自动处理 DPI 换算，禁止手动重复计算。
 - **⚠️ 窗口坐标转换陷阱**：使用 `win32gui.GetWindowRect(hwnd)` 获取的矩形包含标题栏和边框，而截图内容是客户区。点击截图内元素时，必须用 `win32gui.ClientToScreen(hwnd, (0, 0))` 获取客户区原点的屏幕坐标，再加上截图内坐标。禁止直接用 GetWindowRect 左上角 + 截图坐标。**同理禁止 `DwmGetWindowAttribute(hwnd, 9, ...)` 取窗口矩形替代 ClientToScreen，它也包含标题栏/阴影。**
-- **⚠️ Click 后 0% 像素变化 = 点歪了**：ljqCtrl.Click 会报告像素变化百分比。若为 0% 或接近 0%，说明点击落在了错误位置（坐标计算有误），必须立即停下来诊断坐标转换逻辑，禁止盲目重试。常见原因：用了错误的窗口原点API、忘记 `/dpi_scale`、混淆了客户区与窗口矩形。macOS 上多为忘加裁剪原点（应走 `CropToScreen`）。
+- **Click 局部像素变化为0不等于失败**：macOS计算器乘号、词典搜索框实测点击生效但局部diff为0，AXClick回退也可能误报False。先看控件值/焦点/窗口截图；未生效再查窗口原点、DPI、客户区或裁剪原点（`CropToScreen`），禁止盲目重复点击。
+- **macOS键盘修饰标志**：实测普通键继承Command标志而失效；临时将keydown/up均显式`CGEventSetFlags(e, flags)`（含flags=0）后，数字8和回车恢复。仅非零时设置flags不够；正式键盘工具修复须另行确认。
 - **⚠️ win32 DPI 坐标陷阱**：未调用 `SetProcessDPIAware()` 时，`GetWindowRect/ClientToScreen/GetClientRect` 等拿到的窗口/客户区坐标通常是**逻辑坐标**，必须进行换算！
 - **文本输入**：ljqCtrl 无 TypeText/SendKeys。向输入框键入文本：先点击/三击选中字段，再 `pyperclip.copy('文本'); ljqCtrl.Press('ctrl+v')`。
 
